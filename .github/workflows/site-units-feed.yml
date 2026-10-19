@@ -1,0 +1,46 @@
+name: site-units-feed
+# Both storage websites render their unit list through /api/monument/unit-groups.
+# On 19 Oct 2026 Monument put an AWS WAF CAPTCHA in front of its public
+# storefront key and both sites showed "We could not load current availability"
+# for days before anyone noticed; online move-ins stopped. This check loads the
+# feed on both sites every 5 minutes from GitHub (this repository is public, so
+# the minutes are free; the private fleet-watchdog repo would burn its quota),
+# and opens ONE issue here with an @mention (GitHub emails Armaan) within
+# minutes of a failure. The M4 runs the same check every 5 minutes through
+# launchd com.armaan.site-units-watch, so an alert does not depend on GitHub's
+# cron, which dropped scheduled runs for hours during the 19 Oct 2026 incident.
+# Labels: site-units-down (customers cannot see units) and site-units-degraded
+# (sites up, safety net at risk). Scripts: scripts/site_units_check.py and
+# scripts/site_units_issue.sh (shared with the M4 copy in ~/.claude/scripts).
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Evaluate and print, but do not touch issues"
+        type: boolean
+        default: false
+permissions:
+  issues: write
+  contents: read
+  actions: write
+concurrency: site-units-feed
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MENTION: "@armaankpremjee-tech"
+      DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keep the schedule alive (GitHub disables crons after 60 days of repo inactivity)
+        run: gh workflow enable site-units-feed.yml -R "$GITHUB_REPOSITORY" || true
+      - name: Check both sites
+        env:
+          MONUMENT_API_KEY: ${{ secrets.MONUMENT_API_KEY }}
+        run: python3 scripts/site_units_check.py
+      - name: Manage the issues
+        run: bash scripts/site_units_issue.sh
