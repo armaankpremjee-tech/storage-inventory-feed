@@ -1,0 +1,34 @@
+name: refresh
+# Keeps the public inventory snapshot current. The websites fall back to these
+# files only when Monument's API refuses the live call; see README.md.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+concurrency: refresh
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keep the schedule alive (GitHub disables crons after 60 days of repo inactivity)
+        run: gh workflow enable refresh.yml -R "$GITHUB_REPOSITORY" || true
+      - name: Refresh from Monument
+        env:
+          MONUMENT_API_KEY: ${{ secrets.MONUMENT_API_KEY }}
+        run: python3 scripts/refresh.py
+      - name: Commit when anything changed
+        if: always()
+        run: |
+          git config user.name "inventory-refresh"
+          git config user.email "inventory-refresh@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
+          git commit -m "inventory refresh $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push
