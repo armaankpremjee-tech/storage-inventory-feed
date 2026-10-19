@@ -18,3 +18,12 @@ Files are named by Monument facility UUID:
 Everything here is already public on the two websites and on Monument's
 storefront: sizes, rates, availability counts, fees, facility contact details.
 No credentials are stored in this repository.
+
+## Site check
+
+`.github/workflows/site-units-feed.yml` loads `/api/monument/unit-groups` and the
+homepage of both sites every 5 minutes and opens an issue here (labels
+`site-units-down`, `site-units-degraded`) with an @mention when a site cannot show
+its units or the safety net is at risk; it closes the issue on recovery. The M4
+runs the same scripts every 5 minutes (launchd `com.armaan.site-units-watch`) so
+an alert does not depend on GitHub's cron.
