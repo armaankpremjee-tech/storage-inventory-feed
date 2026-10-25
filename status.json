@@ -1,17 +1,17 @@
 {
-  "checked_at": "2026-10-25T17:17:57+00:00",
+  "checked_at": "2026-10-25T19:46:43+00:00",
   "facilities": {
     "29c2b9e2-699f-11f1-989e-e99e7c079122": {
       "available_units": 27,
       "groups": 20,
       "name": "Lifetime Climate Controlled Storage",
-      "refreshed_at": "2026-10-25T17:17:57+00:00"
+      "refreshed_at": "2026-10-25T19:46:43+00:00"
     },
     "29c2b9eb-699f-11f1-989e-e99e7c079122": {
       "available_units": 39,
       "groups": 6,
       "name": "Cypress Mini Storage",
-      "refreshed_at": "2026-10-25T17:17:57+00:00"
+      "refreshed_at": "2026-10-25T19:46:43+00:00"
     }
   },
   "ok": true
