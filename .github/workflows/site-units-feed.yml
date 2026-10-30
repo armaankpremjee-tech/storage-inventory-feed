@@ -5,13 +5,15 @@ name: site-units-feed
 # for days before anyone noticed; online move-ins stopped. This check loads the
 # feed on both sites every 5 minutes from GitHub (this repository is public, so
 # the minutes are free; the private fleet-watchdog repo would burn its quota),
-# and opens ONE issue here with an @mention (GitHub emails Armaan) within
-# minutes of a failure. The M4 runs the same check every 5 minutes through
-# launchd com.armaan.site-units-watch, so an alert does not depend on GitHub's
-# cron, which dropped scheduled runs for hours during the 19 Oct 2026 incident.
-# Labels: site-units-down (customers cannot see units) and site-units-degraded
-# (sites up, safety net at risk). Scripts: scripts/site_units_check.py and
-# scripts/site_units_issue.sh (shared with the M4 copy in ~/.claude/scripts).
+# and keeps ONE issue per alert here as state (no @mention: Armaan, 25 Oct 2026,
+# wants 1 email per broken thing, not GitHub notifications). The M4 runs the same
+# check every 5 minutes through launchd com.armaan.site-units-watch and is the
+# side that emails him, 1 email per open alert issue; GitHub runs this schedule
+# only every 2 to 7 hours in practice. Labels: site-units-down (customers cannot
+# see units), site-units-degraded (sites up, safety net at risk), bot-leads (fake
+# leads in Monument's storefront) and storefront-captcha-off. Scripts:
+# scripts/site_units_check.py and scripts/site_units_issue.sh (shared with the M4
+# copy in ~/.claude/scripts).
 on:
   schedule:
     - cron: "*/5 * * * *"
@@ -29,10 +31,9 @@ concurrency: site-units-feed
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     env:
       GH_TOKEN: ${{ github.token }}
-      MENTION: "@armaankpremjee-tech"
       DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
