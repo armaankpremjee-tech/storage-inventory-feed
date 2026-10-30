@@ -12,6 +12,7 @@ detail=$(python3 -c "import json;print(json.load(open('result.json'))['detail'])
 # script floods Monument with fake leads, which is what got Lifetime's merchant blocked.
 bot_active=$(python3 -c "import json;b=json.load(open('result.json')).get('bot_leads') or {};print(1 if b.get('active') else 0)")
 bot_persist=$(python3 -c "import json;b=json.load(open('result.json')).get('bot_leads') or {};print(1 if b.get('persist') else 0)")
+bot_available=$(python3 -c "import json;b=json.load(open('result.json')).get('bot_leads') or {};print(1 if b.get('available') else 0)")
 bot_summary=$(python3 -c "import json;b=json.load(open('result.json')).get('bot_leads') or {};print(b.get('summary',''))")
 bot_detail=$(python3 -c "import json;b=json.load(open('result.json')).get('bot_leads') or {};print(b.get('detail',''))")
 echo "$(date -u +%FT%TZ) state=$state $summary"
@@ -44,7 +45,8 @@ if [ "$bot_active" = "1" ] || { [ -n "$bot_issue" ] && [ "$bot_persist" = "1" ];
     printf -v still 'Still arriving: %s.\n%s' "$bot_summary" "$bot_detail"
     comment_if_due "$bot_issue" 6 "$still"
   fi
-elif [ -n "$bot_issue" ]; then
+elif [ -n "$bot_issue" ] && [ "$bot_available" = "1" ]; then
+  # Close only on a successful read: a failed leads read is unknown, never clear.
   printf -v clear 'Clear: no bot lead at either facility for 2 hours.\n%s' "$bot_detail"
   gh issue close "$bot_issue" -R "$GITHUB_REPOSITORY" --comment "$clear"
 fi
