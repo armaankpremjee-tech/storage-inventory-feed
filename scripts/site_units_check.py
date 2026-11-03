@@ -8,6 +8,7 @@ Writes result.json for the workflow's issue step:
   detail: markdown bullets with the evidence
   captcha_state: "on" | "off" | "unknown"  (its own alert, label storefront-captcha-off)
   bot_leads: {active, available, summary, detail}  (its own alert, label bot-leads)
+  card_payments: {active, available, summary, detail}  (its own alert, label card-payments-silent)
 
 down     = a site's /api/monument/unit-groups is not a valid inventory after 3
            tries, or its homepage is not serving rendered unit cards.
@@ -28,6 +29,16 @@ bot_leads = read only through the Integration key: leads created at either
            the October 2026 storefront incident, and its footprint showed days
            before the damage did. The output carries counts and signature names
            only, never a lead's data, because this repository is public.
+card_payments = read only through the Integration key: the ledger of both
+           facilities. Active when completed card payments have stopped (no
+           completed card payment for longer than the facility's PAY_SILENCE_H)
+           or when the 1st of the month autopay run produced fewer completed card
+           payments than PAY_MONTH_START_FLOOR by the 7th. Both times a card
+           testing bot hit the Lifetime storefront in 2026 the card processor
+           blocked the merchant and every card payment failed silently for days
+           (12 to 27 Oct, found on day 13). The thresholds are calibrated on the
+           ledger since 20 Aug 2026 (see judge_payments) so that only those
+           outages would have alerted. Hours and counts only in the output.
 """
 import json
 import os
@@ -56,6 +67,24 @@ BOT_BURST_MIN = 60
 BOT_BURST_COUNT = 5              # Abandoned Cart leads inside any 60 minutes
 BOT_DAILY_COUNT = 8              # Abandoned Cart leads in 24 hours; real ones run about 1 a week
 LEAD_TIMEOUT_S = 15
+PAY_LOOKBACK_H = 24 * 12         # ledger rows read per run; longer than any silence limit below
+PAY_SILENCE_H = {                # hours without a completed card payment before it alerts
+    # Calibrated on every completed card payment 20 Aug to 3 Nov 2026. Cypress (211
+    # units): longest normal gap 93 h, the only longer one the 15 to 19 Sep outage
+    # (150 h). Lifetime (98 units, mostly autopay on the 1st): normal gaps reach 126 h
+    # mid month; the 15 to 19 Sep outage was 192 h and the 12 to 27 Oct merchant
+    # block 364 h. Tighter limits page every quiet week.
+    "Cypress Mini Storage": 120,
+    "Lifetime Climate Controlled Storage": 168,
+}
+PAY_MONTH_START_FLOOR = {        # completed card payments expected from the 1st 00:00 UTC autopay run
+    # 1 Nov 2026: Cypress 80, Lifetime 39 (46 of 51 enrolled). A blocked merchant shows 0.
+    "Cypress Mini Storage": 20,
+    "Lifetime Climate Controlled Storage": 10,
+}
+PAY_MONTH_START_FROM_H = 15      # UTC hour on the 1st by which the 3 AM Central run and its retries have posted
+PAY_MONTH_START_DAYS = 7         # the floor is judged from the 1st 15:00 UTC through the 7th
+PAY_TIMEOUT_S = 25
 
 
 def get(url, headers=None, timeout=30):
@@ -257,6 +286,106 @@ def bot_lead_check(key, now, read=recent_leads):
             "detail": "".join(f"\n- {n}" for n in notes), "facilities": facilities, "errors": errors}
 
 
+def recent_payments(key, facility_uuid, since):
+    """Ledger line items created at a facility since the given UTC time. Read only; raises on any doubt."""
+    query = urllib.parse.urlencode({"createdAt.greaterOrEqual": since.strftime("%Y-%m-%dT%H:%M:%S.000Z")})
+    st, _, body = get(f"{INTEGRATION}/facilities/{facility_uuid}/ledgerEntries/uuids?{query}", {"x-api-key": key},
+                      timeout=PAY_TIMEOUT_S)
+    if st != 200:
+        raise RuntimeError(f"ledgerEntries/uuids HTTP {st}")
+    uuids = json.loads(body)
+    if not isinstance(uuids, list):
+        raise RuntimeError("ledgerEntries/uuids did not return a list")
+    rows = []
+    for start in range(0, min(len(uuids), 6000), 1000):  # get_by_uuids takes at most 1,000
+        st, _, body = post(f"{INTEGRATION}/facilities/{facility_uuid}/ledgerEntries/get_by_uuids",
+                           {"lineItemLedgerUuids": uuids[start:start + 1000]}, {"x-api-key": key}, timeout=PAY_TIMEOUT_S)
+        if st != 200:
+            raise RuntimeError(f"ledgerEntries/get_by_uuids HTTP {st}")
+        chunk = json.loads(body)
+        if not isinstance(chunk, list):
+            raise RuntimeError("ledgerEntries/get_by_uuids did not return a list")
+        rows += chunk
+    return rows
+
+
+def completed_card_payments(rows):
+    """Distinct completed card payments (paymentUuid -> UTC time) in ledger line items.
+
+    A payment spreads over several line items (rent, fees, tax), so it is counted
+    once. ACH and cash never count: a blocked card merchant leaves ACH working.
+    """
+    seen = {}
+    for row in rows:
+        if row.get("transactionType") != "PAYMENT" or row.get("paymentStatus") != "COMPLETED":
+            continue
+        if ((row.get("payment") or {}).get("tenderType") or "").upper() != "CREDIT/DEBIT":
+            continue
+        uuid = row.get("paymentUuid")
+        try:
+            when = datetime.fromisoformat((row.get("createdAt") or "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if uuid and (uuid not in seen or when > seen[uuid]):
+            seen[uuid] = when
+    return seen
+
+
+def judge_payments(rows, now, name):
+    """Pure decision for 1 facility's ledger of the last PAY_LOOKBACK_H hours. Hours and counts only."""
+    times = sorted(completed_card_payments(rows).values())
+    last = times[-1] if times else None
+    hours = round((now - last).total_seconds() / 3600, 1) if last else None
+    limit = PAY_SILENCE_H[name]
+    reasons = []
+    if hours is None:
+        reasons.append(f"no completed card payment in {PAY_LOOKBACK_H} hours (limit {limit} h)")
+    elif hours > limit:
+        reasons.append(f"last completed card payment {hours:g} hours ago (limit {limit} h)")
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    in_window = (now.day == 1 and now.hour >= PAY_MONTH_START_FROM_H) or 1 < now.day <= PAY_MONTH_START_DAYS
+    since_start = sum(1 for t in times if t >= month_start) if in_window else None
+    floor = PAY_MONTH_START_FLOOR[name]
+    if in_window and since_start < floor:
+        reasons.append(f"{since_start} completed card payments since the 1st at 00:00 UTC, floor {floor}")
+    return {"card_payments_in_lookback": len(times), "hours_since_last": hours, "limit_h": limit,
+            "since_month_start": since_start, "month_start_floor": floor,
+            "reasons": reasons, "active": bool(reasons)}
+
+
+def card_payment_check(key, now, read=recent_payments):
+    """Card payments at both facilities. available is true only when EVERY facility was read."""
+    if not key:
+        return {"active": False, "available": False, "summary": "card payment check not run (Integration key missing)",
+                "detail": "", "facilities": {}, "errors": ["Integration key missing"]}
+    since = now - timedelta(hours=PAY_LOOKBACK_H)
+    facilities, notes, errors = {}, [], []
+    for name, _, uuid in SITES:
+        try:
+            judged = judge_payments(read(key, uuid, since), now, name)
+        except Exception as e:  # noqa: BLE001
+            errors.append(name)
+            notes.append(f"{name}: ledger could not be read ({str(e)[:60]})")
+            continue
+        facilities[name] = judged
+        if judged["reasons"]:
+            notes.append(f"{name}: " + "; ".join(judged["reasons"]))
+        else:
+            note = f"{name}: last completed card payment {judged['hours_since_last']:g} h ago (limit {judged['limit_h']} h)"
+            if judged["since_month_start"] is not None:
+                note += f", {judged['since_month_start']} since the 1st (floor {judged['month_start_floor']})"
+            notes.append(note)
+    hit = [n for n, f in facilities.items() if f["active"]]
+    if hit:
+        summary = " and ".join(hit) + ": card payments have stopped completing in Monument"
+    elif errors:
+        summary = "could not read the ledger at " + " and ".join(errors) + "; card payments normal where it was read"
+    else:
+        summary = "card payments completing normally at both facilities"
+    return {"active": bool(hit), "available": not errors, "summary": summary,
+            "detail": "".join(f"\n- {n}" for n in notes), "facilities": facilities, "errors": errors}
+
+
 def main():
     now = datetime.now(timezone.utc).replace(microsecond=0)
     sites = [check_site(*s) for s in SITES]
@@ -287,6 +416,8 @@ def main():
     diag.append(feed_note)
     bots = bot_lead_check(key, now)
     diag.append("bot lead tripwire: " + bots["summary"])
+    pays = card_payment_check(key, now)
+    diag.append("card payments: " + pays["summary"])
 
     down = [s for s in sites if not (s["api_ok"] and s["cards_ok"])]
     on_snapshot = [s for s in sites if s["api_ok"] and s["source"] == "snapshot"]
@@ -321,11 +452,13 @@ def main():
     result = {"state": state, "summary": summary, "detail": detail, "checked_at": now.isoformat(),
               "integration_ok": integration_ok, "captcha_on_public_key": captcha_state == "on",
               "captcha_state": captcha_state, "feed_ok": feed_ok, "feed_age_min": feed_age_min,
-              "bot_leads": {k: bots[k] for k in ("active", "available", "summary", "detail")}}
+              "bot_leads": {k: bots[k] for k in ("active", "available", "summary", "detail")},
+              "card_payments": {k: pays[k] for k in ("active", "available", "summary", "detail")}}
     json.dump(result, open("result.json", "w"), indent=2)
     # The log of a public repository: no lead counts, only the 1 line verdicts.
-    printed = {k: v for k, v in result.items() if k != "bot_leads"}
+    printed = {k: v for k, v in result.items() if k not in ("bot_leads", "card_payments")}
     printed["bot_leads"] = {k: bots[k] for k in ("active", "available", "summary")}
+    printed["card_payments"] = {k: pays[k] for k in ("active", "available", "summary")}
     print(json.dumps(printed, indent=2))
     return 0
 

@@ -7,12 +7,14 @@
 # The issues are state, not notifications (Armaan, 25 Oct 2026: "i get too many
 # github notifications"): no @mention, no assignee. The M4 watcher sets
 # ALERT_EMAIL_HELPER, which sends Armaan exactly 1 email per open bot-leads,
-# site-units-down or storefront-captcha-off issue (and per degraded issue while
-# Monument refuses the Integration key), and records it in the issue body.
+# site-units-down, storefront-captcha-off or card-payments-silent issue (and per
+# degraded issue while Monument refuses the Integration key), and records it in
+# the issue body.
 set -u
 now=$(date -u +%s)
 field() { python3 -c "import json,sys;r=json.load(open('result.json'));v=r.get(sys.argv[1]);print('' if v is None else v)" "$1"; }
 bot() { python3 -c "import json,sys;b=json.load(open('result.json')).get('bot_leads') or {};v=b.get(sys.argv[1]);print(v if isinstance(v,str) else (1 if v else 0))" "$1"; }
+pay() { python3 -c "import json,sys;b=json.load(open('result.json')).get('card_payments') or {};v=b.get(sys.argv[1]);print(v if isinstance(v,str) else (1 if v else 0))" "$1"; }
 state=$(field state)
 summary=$(field summary)
 detail=$(field detail)
@@ -22,15 +24,21 @@ bot_active=$(bot active)
 bot_available=$(bot available)
 bot_summary=$(bot summary)
 bot_detail=$(bot detail)
+pay_active=$(pay active)
+pay_available=$(pay available)
+pay_summary=$(pay summary)
+pay_detail=$(pay detail)
 echo "$(date -u +%FT%TZ) state=$state $summary"
 echo "$(date -u +%FT%TZ) captcha=$captcha_state bot_leads active=$bot_active available=$bot_available $bot_summary"
+echo "$(date -u +%FT%TZ) card_payments active=$pay_active available=$pay_available $pay_summary"
 open_issue() { gh issue list -R "$GITHUB_REPOSITORY" --label "$1" --state open --json number --jq '.[0].number // empty'; }
 down_issue=$(open_issue site-units-down)
 deg_issue=$(open_issue site-units-degraded)
 bot_issue=$(open_issue bot-leads)
 cap_issue=$(open_issue storefront-captcha-off)
+pay_issue=$(open_issue card-payments-silent)
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  echo "DRY RUN, no issue changes. down_issue=${down_issue:-none} degraded_issue=${deg_issue:-none} bot_issue=${bot_issue:-none} captcha_issue=${cap_issue:-none}"
+  echo "DRY RUN, no issue changes. down_issue=${down_issue:-none} degraded_issue=${deg_issue:-none} bot_issue=${bot_issue:-none} captcha_issue=${cap_issue:-none} payments_issue=${pay_issue:-none}"
   exit 0
 fi
 epoch_of() { python3 -c "import sys,datetime;s=sys.argv[1].replace('Z','+00:00');print(int(datetime.datetime.fromisoformat(s).timestamp()))" "$1" 2>/dev/null || echo 0; }
@@ -66,6 +74,24 @@ elif [ -n "$bot_issue" ] && [ "$bot_available" = "1" ]; then
   # A failed read at either facility is unknown, never clear.
   printf -v clear 'Clear: no bot lead at either facility in 24 hours.\n%s' "$bot_detail"
   gh issue close "$bot_issue" -R "$GITHUB_REPOSITORY" --comment "$clear"
+fi
+
+# Card payments: open on the first run that sees a facility's completed card
+# payments stopped (or a 1st of the month autopay run far below its floor),
+# comment every 6 hours while it lasts, close only after a run that read BOTH
+# ledgers and found both facilities normal. Hours and counts only: public repo.
+if [ "$pay_active" = "1" ]; then
+  printf -v pbody '%s.\n\nCompleted card payments are the heartbeat of a facility. Both times a card testing bot hit the Lifetime storefront in 2026 the card processor blocked the merchant and every card payment failed silently for days (12 to 27 Oct, noticed on day 13), while ACH kept working. Evidence from this run (hours and counts only):\n%s\n\nWhat to do today: read the open Monument ticket thread about the storefront and card testing in the personal mailbox before writing anything, and reply there (never a new Monument thread). Ask whether the processor or the card issuers have a block on the facility'"'"'s merchant account, since when, and the lift date; point tenants to ACH meanwhile. Nothing goes to tenants or Adela from this alert. This check runs every 5 minutes from GitHub and from the M4, comments every 6 hours while it lasts, and closes itself once both ledgers read normal again.' "$pay_summary" "$pay_detail"
+  if [ -z "$pay_issue" ]; then
+    create card-payments-silent "Card payments silent: $pay_summary" "$pbody"
+  else
+    printf -v still 'Still silent: %s.\n%s' "$pay_summary" "$pay_detail"
+    comment_if_due "$pay_issue" 6 "$still"
+  fi
+elif [ -n "$pay_issue" ] && [ "$pay_available" = "1" ]; then
+  # A failed ledger read at either facility is unknown, never clear.
+  printf -v pclear 'Clear: completed card payments are back to normal at both facilities.\n%s' "$pay_detail"
+  gh issue close "$pay_issue" -R "$GITHUB_REPOSITORY" --comment "$pclear"
 fi
 
 # Storefront captcha: its own issue, so it is announced at once and never hides,
@@ -114,7 +140,7 @@ esac
 
 # Delivery (the M4 only): 1 email per open alert issue, recorded in its body.
 if [ -n "${ALERT_EMAIL_HELPER:-}" ]; then
-  for label in bot-leads site-units-down storefront-captcha-off site-units-degraded; do
+  for label in bot-leads site-units-down storefront-captcha-off card-payments-silent site-units-degraded; do
     if [ "$label" = "site-units-degraded" ] && [ "$integration_ok" != "False" ]; then
       continue  # degraded only pages while Monument refuses the Integration key
     fi
