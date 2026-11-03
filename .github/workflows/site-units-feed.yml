@@ -11,7 +11,8 @@ name: site-units-feed
 # side that emails him, 1 email per open alert issue; GitHub runs this schedule
 # only every 2 to 7 hours in practice. Labels: site-units-down (customers cannot
 # see units), site-units-degraded (sites up, safety net at risk), bot-leads (fake
-# leads in Monument's storefront) and storefront-captcha-off. Scripts:
+# leads in Monument's storefront), storefront-captcha-off and card-payments-silent
+# (completed card payments stopped, the 12 Oct 2026 merchant block). Scripts:
 # scripts/site_units_check.py and scripts/site_units_issue.sh (shared with the M4
 # copy in ~/.claude/scripts).
 on:
