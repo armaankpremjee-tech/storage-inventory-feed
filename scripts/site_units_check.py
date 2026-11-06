@@ -27,8 +27,13 @@ bot_leads = read only through the Integration key: leads created at either
            in a burst or in a volume no real visitor produces, or any carries a
            template signature (see lead_signatures). This is the pattern behind
            the October 2026 storefront incident, and its footprint showed days
-           before the damage did. The output carries counts and signature names
-           only, never a lead's data, because this repository is public.
+           before the damage did. Since 6 Nov 2026 it also judges leads of EVERY
+           source that have not converted and that no staff member keyed (see
+           judge_leads): that night the bot relabelled its leads from Abandoned
+           Cart to Website and the Abandoned Cart rules alone would have closed
+           the alert while it kept posting.
+           The output carries counts and signature names only, never a lead's
+           data, because this repository is public.
 card_payments = read only through the Integration key: the ledger of both
            facilities. Active when completed card payments have stopped (no
            completed card payment for longer than the facility's PAY_SILENCE_H)
@@ -61,11 +66,23 @@ FEED_STATUS = "https://raw.githubusercontent.com/armaankpremjee-tech/storage-inv
 UA = "fleet-watchdog site-units-feed (github actions)"
 FEED_MAX_AGE_H = 12              # longest observed refresh gap 7.2 h (19 to 30 Oct 2026)
 SNAPSHOT_SERVED_MAX_AGE_H = 3    # only matters while a site actually serves the snapshot
-NEIGHBOR_MARKETING_SOURCE = "474ca270-9d82-11f1-91fb-cb3df9954417"  # every 2026 storefront bot lead carried it
+NEIGHBOR_MARKETING_SOURCE = "474ca270-9d82-11f1-91fb-cb3df9954417"  # on every storefront bot lead until Oct 2026
 BOT_WINDOW_H = 24                # leads read per run; also covers GitHub's 2 to 7 hour gaps
 BOT_BURST_MIN = 60
 BOT_BURST_COUNT = 5              # Abandoned Cart leads inside any 60 minutes
 BOT_DAILY_COUNT = 8              # Abandoned Cart leads in 24 hours; real ones run about 1 a week
+# Rules for leads of ANY source that have not converted and that no staff member
+# keyed (a storefront post cannot carry agentUserAccountUuid: Monument's shopping
+# API has no such field). Calibrated by replaying every lead that exists at both
+# facilities (16 Jul to 6 Nov 2026) with every lead counted as unconverted, the
+# worst case. Before 31 Oct 2026 the most different people inside any 60 seconds
+# was 2, the most with neither a phone nor an address inside any 24 hours was 1,
+# and the most such leads inside any 24 hours was 5. With these limits the replay
+# pages on 3, 4 and 6 Nov at Lifetime and never else.
+BOT_MACHINE_S = 60
+BOT_MACHINE_COUNT = 3            # different people inside any 60 seconds
+BOT_BARE_COUNT = 4               # different people with no phone and no address in 24 hours
+BOT_VOLUME_COUNT = 12            # such leads in 24 hours, whoever they claim to be
 LEAD_TIMEOUT_S = 15
 PAY_LOOKBACK_H = 24 * 12         # ledger rows read per run; longer than any silence limit below
 PAY_SILENCE_H = {                # hours without a completed card payment before it alerts
@@ -171,9 +188,10 @@ def probe_captcha():
 def lead_signatures(lead):
     """Names of the template signatures a lead carries; empty for a normal lead.
 
-    Everything but the template address applies to Abandoned Cart leads only: the
-    storefront bot only ever produced those, and staff, SpareFoot or website test
-    leads (Cypress, Jul and Aug 2026) must not page. Calibrated on every lead at
+    Everything but the template address applies to Abandoned Cart leads only: until
+    6 Nov 2026 the storefront bot only produced those (judge_leads has the rules
+    for every other source), and staff, SpareFoot or website test leads (Cypress,
+    Jul and Aug 2026) must not page on a name or a phone. Calibrated on every lead at
     both facilities since 1 Sep 2026: 0 real leads match. The names never carry
     the lead's own data.
     """
@@ -224,14 +242,55 @@ def recent_leads(key, facility_uuid, since):
 
 
 def _created(lead):
+    """The lead's creation time in UTC, or None when it cannot be read.
+
+    Python 3.9 and 3.10 (the Mac) only read 0, 3 or 6 fraction digits where 3.11
+    and later (the GitHub runner) read any number, so the fraction is brought to
+    6 digits first: both hosts must judge the same leads the same way.
+    """
+    text = (lead.get("dateCreated") or "").replace("Z", "+00:00")
+    text = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], text, count=1)
     try:
-        return datetime.fromisoformat((lead.get("dateCreated") or "").replace("Z", "+00:00"))
+        when = datetime.fromisoformat(text)
     except ValueError:
         return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _identity(lead):
+    """Who a lead claims to be: email and name together, lower cased; None when it gives neither.
+
+    Two leads are the same person only when both match. A visitor who submits a
+    form twice is 1 person; a script that reuses 1 mailbox under changing names,
+    or 1 name under changing mailboxes, is not. Only ever compared, never printed.
+    """
+    person = lead.get("primaryPerson") or {}
+    email = (person.get("email") or "").strip().lower()
+    name = f"{person.get('firstName') or ''} {person.get('lastName') or ''}".strip().lower()
+    return (email, name) if email or name else None
+
+
+def _is_bare(lead):
+    """A lead with neither a phone nor an address: at most a name and an email."""
+    person = lead.get("primaryPerson") or {}
+    return not re.sub(r"\D", "", person.get("phone") or "") and not (person.get("addressLine1") or "").strip()
 
 
 def judge_leads(leads, now):
-    """Pure decision for 1 facility's leads of the last BOT_WINDOW_H hours. Counts and names only."""
+    """Pure decision for 1 facility's leads of the last BOT_WINDOW_H hours. Counts and names only.
+
+    Two families of rules. The Abandoned Cart rules and the template signatures
+    are the October 2026 footprint and count every lead they match. The other 3
+    look at every lead, whatever its source, that has not converted and that no
+    staff member keyed, because the bot labels its leads as it likes (6 Nov
+    2026: Website, a name and an unrelated email, nothing else, 3 to 6 of them
+    5 seconds apart): a machine burst (different people inside 1 minute), leads
+    with no phone and no address, and plain volume. A converted lead is a paying
+    tenant and a staff keyed lead is our own work; neither counts toward these
+    3 rules, so a busy move in day or a batch of logged calls cannot page.
+    A lead whose date cannot be read was still returned for this window by
+    Monument, so it counts toward the last 2 of them: unreadable is never clear.
+    """
     since = now - timedelta(hours=BOT_WINDOW_H)
     carts = sorted(t for t in (_created(lead) for lead in leads if lead.get("leadSource") == "Abandoned Cart")
                    if t is not None and t >= since)
@@ -247,6 +306,21 @@ def judge_leads(leads, now):
             continue
         for sig in lead_signatures(lead):
             flagged[sig] = flagged.get(sig, 0) + 1
+    posted = []  # (created or None, who, bare): each unconverted lead in the window that no staff member keyed
+    for index, lead in enumerate(leads):
+        if lead.get("leadStatus") == "CONVERTED" or lead.get("agentUserAccountUuid"):
+            continue
+        created = _created(lead)
+        if created is not None and created < since:
+            continue
+        posted.append((created, _identity(lead) or ("", index), _is_bare(lead)))  # a nameless lead is its own person
+    timed = sorted((row for row in posted if row[0] is not None), key=lambda row: row[0])
+    machine, start = 0, 0
+    for end, (when, _, _) in enumerate(timed):  # most different people inside any BOT_MACHINE_S seconds
+        while when - timed[start][0] > timedelta(seconds=BOT_MACHINE_S):
+            start += 1
+        machine = max(machine, len({who for _, who, _ in timed[start:end + 1]}))
+    bare = len({who for _, who, is_bare in posted if is_bare})
     reasons = []
     if burst >= BOT_BURST_COUNT:
         reasons.append(f"{burst} Abandoned Cart leads within {BOT_BURST_MIN} minutes")
@@ -254,8 +328,17 @@ def judge_leads(leads, now):
         reasons.append(f"{len(carts)} Abandoned Cart leads in {BOT_WINDOW_H} hours")
     if flagged:
         reasons.append("template signatures: " + ", ".join(f"{k} x{v}" for k, v in sorted(flagged.items())))
+    if machine >= BOT_MACHINE_COUNT:
+        reasons.append(f"{machine} different people within {BOT_MACHINE_S} seconds")
+    if bare >= BOT_BARE_COUNT:
+        reasons.append(f"{bare} different people with no phone and no address in {BOT_WINDOW_H} hours")
+    volume_only = False
+    if len(posted) >= BOT_VOLUME_COUNT:
+        volume_only = not reasons  # many leads and nothing else odd about them: possibly real demand
+        reasons.append(f"{len(posted)} unconverted leads that staff did not key in {BOT_WINDOW_H} hours")
     return {"leads": len(leads), "abandoned_cart": len(carts), "max_in_burst": burst,
-            "signatures": flagged, "reasons": reasons, "active": bool(reasons)}
+            "signatures": flagged, "unconverted": len(posted), "max_in_machine_burst": machine,
+            "bare": bare, "volume_only": volume_only, "reasons": reasons, "active": bool(reasons)}
 
 
 def bot_lead_check(key, now, read=recent_leads):
@@ -276,8 +359,14 @@ def bot_lead_check(key, now, read=recent_leads):
         notes.append(f"{name}: {judged['leads']} leads in {BOT_WINDOW_H} h, {judged['abandoned_cart']} Abandoned Cart, "
                      + ("; ".join(judged["reasons"]) if judged["reasons"] else "no bot pattern"))
     hit = [n for n, f in facilities.items() if f["active"]]
-    if hit:
-        summary = " and ".join(hit) + ": fake leads are being posted into Monument's storefront"
+    odd = [n for n in hit if facilities[n]["volume_only"]]  # volume alone may be real demand: say what was measured
+    sure = [n for n in hit if n not in odd]
+    if sure:
+        summary = " and ".join(sure) + ": fake leads are being posted into Monument's storefront"
+        if odd:
+            summary += "; " + " and ".join(odd) + f": an unusual number of new leads in {BOT_WINDOW_H} hours"
+    elif odd:
+        summary = " and ".join(odd) + f": an unusual number of new leads in {BOT_WINDOW_H} hours, possibly a bot"
     elif errors:
         summary = "could not read leads at " + " and ".join(errors) + "; no bot pattern where they were read"
     else:
