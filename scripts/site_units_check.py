@@ -9,6 +9,8 @@ Writes result.json for the workflow's issue step:
   captcha_state: "on" | "off" | "unknown"  (its own alert, label storefront-captcha-off)
   bot_leads: {active, available, summary, detail}  (its own alert, label bot-leads)
   card_payments: {active, available, summary, detail}  (its own alert, label card-payments-silent)
+  online_rentals: {active, available, summary, detail, hours_since_last, limit_h, lookback_h}
+                (its own alert, label online-rentals-silent)
 
 down     = a site's /api/monument/unit-groups is not a valid inventory after 3
            tries, or its homepage is not serving rendered unit cards.
@@ -48,7 +50,21 @@ card_payments = read only through the Integration key: the ledger of both
            pay is a quiet week, not an alert: that day Lifetime passed 168 h only
            because no tenant had tried to pay since 6 Nov (see payment_attempts).
            Hours and counts only in the output.
+online_rentals = read only through the Integration key: leads created at both
+           facilities in the last ONLINE_LOOKBACK_H hours. A self serve lead is
+           one a customer made in the website checkout (an online rental or an
+           abandoned cart): source Website or Abandoned Cart, no staff agent, and
+           nothing the bot lead rules flag (see classify_online_leads). Active
+           when the newest self serve lead at EITHER facility is older than
+           ONLINE_SILENCE_H. Both facilities are judged together because Lifetime
+           alone had whole weeks with none in Sep and Oct 2026. From 6 Nov 2026
+           17:30Z, when Monument put Cloudflare Turnstile on the rental flow,
+           neither facility got a single one for over a week and nothing noticed
+           (it surfaced on 13 Nov only because Lifetime's card payments went
+           quiet). A failed read is unknown, never clear. Hours and counts only
+           in the output.
 """
+import bisect
 import json
 import os
 import re
@@ -123,6 +139,18 @@ PAY_TIMEOUT_S = 25
 PAY_BACKSTOP_FACTOR = 1.5        # Lifetime 252 h, Cypress 180 h (the October 2026 block was found by hand on day 13)
 PAY_ATTEMPT_TRIES = 3            # tries of the rental records read; still unreadable means no verdict this run
 PAY_ATTEMPT_RETRY_S = 5
+ONLINE_SOURCES = ("Website", "Abandoned Cart")  # what the website checkout writes; a lead staff keyed carries an agent
+ONLINE_LOOKBACK_H = 24 * 30      # leads read per run; far past the limit, so a long stall still reads in hours
+ONLINE_SILENCE_H = 177           # hours without a self serve lead at EITHER facility before it alerts
+# Calibrated on every self serve lead at both facilities 20 Aug to 13 Nov 2026, judged by classify_online_leads (55:
+# Cypress 35, Lifetime 20; 9 keyed by staff and 6 with bot signatures left out; only leads that still exist, since
+# Monument deleted the flood fakes). The longest gaps between consecutive ones, both facilities together: 176.6 h
+# (18 to 26 Sep), 157.6 h (21 to 28 Aug), 123.3 h (31 Oct to 6 Nov), 106.2 h (7 to 11 Sep), 102.1 h (22 to 26 Oct),
+# 80.2 h (16 to 20 Oct), every other under 70 h. The stall from 6 Nov 02:21Z had reached 186.8 h on 13 Nov 21:12Z.
+# 177 h is the smallest whole number of hours above the longest normal gap; replayed every 15 minutes since 20 Aug,
+# it alerts on that stall alone, from 13 Nov 11:32Z. Per facility would page on quiet weeks: Lifetime alone went
+# 388 h (12 to 28 Oct) and Cypress alone 242 h (18 to 28 Sep) without one.
+ONLINE_MAX_LEADS = 3000          # recent_leads hydrates at most 3,000, so that many is a flood and gives no verdict
 
 
 def get(url, headers=None, timeout=30):
@@ -596,6 +624,136 @@ def card_payment_check(key, now, read=recent_payments, read_attempts=payment_att
             "detail": "".join(f"\n- {n}" for n in notes), "facilities": facilities, "errors": errors + unread}
 
 
+def _staff_keyed(lead):
+    return bool(lead.get("agentName") or lead.get("agentUserAccountUuid"))
+
+
+def classify_online_leads(leads):
+    """1 facility's leads split into the self serve leads that count and the ones that do not. Pure; times and counts out.
+
+    A lead is self serve when the website checkout made it: source Website or
+    Abandoned Cart and no staff agent (a lead staff keyed carries agentName and
+    agentUserAccountUuid, which a storefront post cannot set). It counts unless the
+    bot lead rules flag it: a template signature on the lead itself
+    (lead_signatures), or a BOT_WINDOW_H window holding it in which judge_leads
+    fires on a pattern of leads (bursts, machine bursts, bare leads, volume). Every
+    window holding the lead is judged, the one ending at it and those ending up to
+    BOT_WINDOW_H later, because the first leads of a flood look normal until the
+    burst behind them arrives (29 Aug 2026 22:40Z was the first of 1,950 fakes). A
+    window that fires only on another lead's own signature does not taint its
+    neighbours: on 12 Oct 2026 a real online move in came 5 hours before an operator
+    test record. A lead that converted is a paying tenant, so no window stops it
+    (judge_leads never counts a converted lead toward its pattern rules either; the
+    6 Nov 2026 flood had a real move in between its clusters); only a signature of
+    its own does. A lead whose date cannot be read never counts, since it cannot
+    show that a rental arrived. Newest first, so a flood is flagged a window at a time.
+    Returns {"counted": sorted UTC times, "staff": n, "bot": n, "undated": n, "other": n}.
+    """
+    dated, out = [], {"counted": [], "staff": 0, "bot": 0, "undated": 0, "other": 0}
+    for lead in leads:
+        when = _created(lead)
+        if when is not None:
+            dated.append((when, lead))
+        elif lead.get("leadSource") in ONLINE_SOURCES and not _staff_keyed(lead):
+            out["undated"] += 1
+    dated.sort(key=lambda pair: pair[0])
+    times = [when for when, _ in dated]
+    span = timedelta(hours=BOT_WINDOW_H)
+    verdicts = {}  # window end -> (a pattern fired, index of its first lead, index after its last lead)
+
+    def window(end):
+        if end not in verdicts:
+            first, stop = bisect.bisect_left(times, end - span), bisect.bisect_right(times, end)
+            judged = judge_leads([lead for _, lead in dated[first:stop]], end)
+            # judge_leads adds exactly 1 reason for template signatures; any other reason is a pattern of leads.
+            verdicts[end] = (len(judged["reasons"]) > (1 if judged["signatures"] else 0), first, stop)
+        return verdicts[end]
+
+    flagged = [False] * len(dated)
+    for i in range(len(dated) - 1, -1, -1):
+        when, lead = dated[i]
+        if _staff_keyed(lead):
+            out["staff"] += 1
+            continue
+        if lead.get("leadSource") not in ONLINE_SOURCES:
+            out["other"] += 1
+            continue
+        signed, converted = bool(lead_signatures(lead)), lead.get("leadStatus") == "CONVERTED"
+        nxt, last = i, bisect.bisect_right(times, when + span)
+        while not signed and not converted and not flagged[i] and nxt < last:
+            fired, first, stop = window(times[nxt])
+            if fired:
+                for k in range(first, stop):
+                    flagged[k] = True
+            nxt = stop
+        if signed or (flagged[i] and not converted):
+            out["bot"] += 1
+        else:
+            out["counted"].append(when)
+    out["counted"].sort()
+    return out
+
+
+def _hours_ago(now, when):
+    return max(0.0, round((now - when).total_seconds() / 3600, 1))
+
+
+def judge_online_rentals(classified, now):
+    """Pure decision across both facilities, every one read. Hours and counts only.
+
+    classified is {facility name: classify_online_leads(...)}. Active when the newest
+    self serve lead at either facility is older than ONLINE_SILENCE_H, or there is
+    none in the lookback.
+    """
+    newest = max((f["counted"][-1] for f in classified.values() if f["counted"]), default=None)
+    hours = _hours_ago(now, newest) if newest else None
+    return {"hours_since_last": hours, "limit_h": ONLINE_SILENCE_H,
+            "counted": sum(len(f["counted"]) for f in classified.values()),
+            "active": hours is None or hours > ONLINE_SILENCE_H}
+
+
+def online_rentals_check(key, now, read=recent_leads):
+    """Self serve leads at both facilities, judged together. available is true only when EVERY facility was read."""
+    base = {"active": False, "available": False, "hours_since_last": None, "limit_h": ONLINE_SILENCE_H,
+            "lookback_h": ONLINE_LOOKBACK_H, "facilities": {}}
+    if not key:
+        return dict(base, summary="online rentals check not run (Integration key missing)", detail="",
+                    errors=["Integration key missing"])
+    days = ONLINE_LOOKBACK_H // 24
+    classified, notes, errors = {}, [], []
+    for name, _, uuid in SITES:
+        try:
+            leads = read(key, uuid, now - timedelta(hours=ONLINE_LOOKBACK_H))
+            if len(leads) >= ONLINE_MAX_LEADS:
+                raise RuntimeError(f"{len(leads)} leads in {days} days, more than this check judges")
+            judged = classify_online_leads(leads)
+        except Exception as e:  # noqa: BLE001
+            errors.append(name)
+            notes.append(f"{name}: leads could not be read ({str(e)[:60]})")
+            continue
+        classified[name] = judged
+        counted = judged["counted"]
+        note = (f"{name}: newest self serve lead {_hours_ago(now, counted[-1]):g} h ago, {len(counted)} in {days} days"
+                if counted else f"{name}: no self serve lead in {days} days")
+        skipped = [f"{judged[k]} {what}" for k, what in (("staff", "keyed by staff"), ("bot", "flagged by the bot lead rules"),
+                                                         ("undated", "without a readable date")) if judged[k]]
+        notes.append(note + (" (not counted: " + ", ".join(skipped) + ")" if skipped else ""))
+    detail = "".join(f"\n- {n}" for n in notes)
+    if errors:
+        return dict(base, summary="could not read leads at " + " and ".join(errors) + ", so no verdict on online "
+                    "rentals this run", detail=detail, facilities=classified, errors=errors)
+    verdict = judge_online_rentals(classified, now)
+    hours = verdict["hours_since_last"]
+    if hours is None:
+        summary = f"No online rentals or abandoned carts at either facility in {days} days (limit {ONLINE_SILENCE_H} h)"
+    elif verdict["active"]:
+        summary = f"No online rentals or abandoned carts at either facility for {hours:g} hours (limit {ONLINE_SILENCE_H} h)"
+    else:
+        summary = f"online rentals arriving: newest self serve lead {hours:g} h ago (limit {ONLINE_SILENCE_H} h)"
+    return dict(base, active=verdict["active"], available=True, summary=summary, detail=detail,
+                hours_since_last=hours, facilities=classified, errors=[])
+
+
 def main():
     now = datetime.now(timezone.utc).replace(microsecond=0)
     sites = [check_site(*s) for s in SITES]
@@ -628,6 +786,8 @@ def main():
     diag.append("bot lead tripwire: " + bots["summary"])
     pays = card_payment_check(key, now)
     diag.append("card payments: " + pays["summary"])
+    online = online_rentals_check(key, now)
+    diag.append("online rentals: " + online["summary"])
 
     down = [s for s in sites if not (s["api_ok"] and s["cards_ok"])]
     on_snapshot = [s for s in sites if s["api_ok"] and s["source"] == "snapshot"]
@@ -663,12 +823,15 @@ def main():
               "integration_ok": integration_ok, "captcha_on_public_key": captcha_state == "on",
               "captcha_state": captcha_state, "feed_ok": feed_ok, "feed_age_min": feed_age_min,
               "bot_leads": {k: bots[k] for k in ("active", "available", "summary", "detail")},
-              "card_payments": {k: pays[k] for k in ("active", "available", "summary", "detail")}}
+              "card_payments": {k: pays[k] for k in ("active", "available", "summary", "detail")},
+              "online_rentals": {k: online[k] for k in ("active", "available", "summary", "detail", "hours_since_last",
+                                                        "limit_h", "lookback_h")}}
     json.dump(result, open("result.json", "w"), indent=2)
     # The log of a public repository: no lead counts, only the 1 line verdicts.
-    printed = {k: v for k, v in result.items() if k not in ("bot_leads", "card_payments")}
+    printed = {k: v for k, v in result.items() if k not in ("bot_leads", "card_payments", "online_rentals")}
     printed["bot_leads"] = {k: bots[k] for k in ("active", "available", "summary")}
     printed["card_payments"] = {k: pays[k] for k in ("active", "available", "summary")}
+    printed["online_rentals"] = {k: online[k] for k in ("active", "available", "summary")}
     print(json.dumps(printed, indent=2))
     return 0
 
