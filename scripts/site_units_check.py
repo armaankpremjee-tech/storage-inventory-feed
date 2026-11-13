@@ -37,13 +37,17 @@ bot_leads = read only through the Integration key: leads created at either
 card_payments = read only through the Integration key: the ledger of both
            facilities. Active when completed card payments have stopped (no
            completed card payment for longer than the facility's PAY_SILENCE_H)
-           or when the 1st of the month autopay run produced fewer completed card
-           payments than PAY_MONTH_START_FLOOR by the 7th. Both times a card
-           testing bot hit the Lifetime storefront in 2026 the card processor
-           blocked the merchant and every card payment failed silently for days
-           (12 to 27 Oct, found on day 13). The thresholds are calibrated on the
-           ledger since 20 Aug 2026 (see judge_payments) so that only those
-           outages would have alerted. Hours and counts only in the output.
+           and somebody has tried to pay since, when the silence passes
+           PAY_BACKSTOP_FACTOR times the limit, or when the 1st of the month
+           autopay run produced fewer completed card payments than
+           PAY_MONTH_START_FLOOR by the 7th. Both times a card testing bot hit the
+           Lifetime storefront in 2026 the card processor blocked the merchant and
+           every card payment failed silently for days (12 to 27 Oct, found on day
+           13). The silence limits are calibrated on the ledger since 20 Aug 2026
+           (see judge_payments). Since 13 Nov 2026 a silence with nobody trying to
+           pay is a quiet week, not an alert: that day Lifetime passed 168 h only
+           because no tenant had tried to pay since 6 Nov (see payment_attempts).
+           Hours and counts only in the output.
 """
 import json
 import os
@@ -84,7 +88,7 @@ BOT_MACHINE_COUNT = 3            # different people inside any 60 seconds
 BOT_BARE_COUNT = 4               # different people with no phone and no address in 24 hours
 BOT_VOLUME_COUNT = 12            # such leads in 24 hours, whoever they claim to be
 LEAD_TIMEOUT_S = 15
-PAY_LOOKBACK_H = 24 * 12         # ledger rows read per run; longer than any silence limit below
+PAY_LOOKBACK_H = 24 * 15         # ledger rows read per run; longer than any backstop below (1.5 x the 168 h limit)
 PAY_SILENCE_H = {                # hours without a completed card payment before it alerts
     # Calibrated on every completed card payment 20 Aug to 3 Nov 2026. Cypress (211
     # units): longest normal gap 93 h, the only longer one the 15 to 19 Sep outage
@@ -102,6 +106,23 @@ PAY_MONTH_START_FLOOR = {        # completed card payments expected from the 1st
 PAY_MONTH_START_FROM_H = 15      # UTC hour on the 1st by which the 3 AM Central run and its retries have posted
 PAY_MONTH_START_DAYS = 7         # the floor is judged from the 1st 15:00 UTC through the 7th
 PAY_TIMEOUT_S = 25
+# A silence past PAY_SILENCE_H is a quiet week, not an alert, only when NOBODY has
+# tried to pay since the last completed card payment. The ledger records completed
+# payments only, but every rental record's lastPayment moves on each attempt, a
+# decline included (checked live 13 Nov 2026: Cypress 18d shows its 10 Nov
+# insufficient funds decline, Lifetime 76 its 12 Oct decline in the Payrix block,
+# Lifetime P5 its failed 1 Nov autopay, none with a ledger payment). Any attempt
+# after the last completed card payment (a decline, or even an ACH payment) keeps
+# the old silence alert. lastPayment only ever moves forward, so once someone has
+# tried, the alert holds until a card payment completes: a decline cannot be
+# hidden by the same tenant paying by ACH later. On 13 Nov 2026 Lifetime passed
+# 168 h with no attempt at all since 6 Nov (all 48 autopay rentals paid, Monument's
+# Failed tab empty), a quiet week that paged anyway. Declines at move in leave no
+# rental record and a change in what Monument writes to lastPayment would hide
+# declines, so a silence past the backstop alerts whatever the attempts show.
+PAY_BACKSTOP_FACTOR = 1.5        # Lifetime 252 h, Cypress 180 h (the October 2026 block was found by hand on day 13)
+PAY_ATTEMPT_TRIES = 3            # tries of the rental records read; still unreadable means no verdict this run
+PAY_ATTEMPT_RETRY_S = 5
 
 
 def get(url, headers=None, timeout=30):
@@ -398,11 +419,27 @@ def recent_payments(key, facility_uuid, since):
     return rows
 
 
+def _utc(text):
+    """A Monument ISO time in UTC, or None. The fraction is padded to 6 digits as in _created (Python 3.9 on the Mac)."""
+    text = (text or "").replace("Z", "+00:00")
+    text = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], text, count=1)
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
 def completed_card_payments(rows):
     """Distinct completed card payments (paymentUuid -> UTC time) in ledger line items.
 
     A payment spreads over several line items (rent, fees, tax), so it is counted
-    once. ACH and cash never count: a blocked card merchant leaves ACH working.
+    once, dated by its EARLIEST line: Monument adds lines to old payments when the
+    invoice run on the 25th applies prepaid credit or staff void a paid invoice
+    (seen 25 Aug and 25 Oct 2026, 9 to 26 days after the payment), and those lines
+    are not a new payment. A payment older than the lookback whose later line falls
+    inside it is still dated by that line; the 1st of the month floor bounds it.
+    ACH and cash never count: a blocked card merchant leaves ACH working.
     """
     seen = {}
     for row in rows:
@@ -410,27 +447,85 @@ def completed_card_payments(rows):
             continue
         if ((row.get("payment") or {}).get("tenderType") or "").upper() != "CREDIT/DEBIT":
             continue
-        uuid = row.get("paymentUuid")
-        try:
-            when = datetime.fromisoformat((row.get("createdAt") or "").replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if uuid and (uuid not in seen or when > seen[uuid]):
+        uuid, when = row.get("paymentUuid"), _utc(row.get("createdAt"))
+        if uuid and when and (uuid not in seen or when < seen[uuid]):
             seen[uuid] = when
     return seen
 
 
-def judge_payments(rows, now, name):
-    """Pure decision for 1 facility's ledger of the last PAY_LOOKBACK_H hours. Hours and counts only."""
+def payment_attempts(key, facility_uuid):
+    """Each rental record's latest payment attempt at a facility, {rentalRecordUuid: UTC time}. Read only; raises on any doubt.
+
+    The rental record's lastPayment (expand[lastPayment]) moves on every attempt, a
+    decline included, which the ledger never records. Rentals that never paid are
+    left out. No rental records, or none carrying a lastPayment, means the read or
+    the expand stopped working: unknown, never quiet.
+    """
+    st, _, body = get(f"{INTEGRATION}/facilities/{facility_uuid}/rentalRecords/uuids", {"x-api-key": key},
+                      timeout=PAY_TIMEOUT_S)
+    if st != 200:
+        raise RuntimeError(f"rentalRecords/uuids HTTP {st}")
+    uuids = json.loads(body)
+    if not isinstance(uuids, list) or not uuids:
+        raise RuntimeError("rentalRecords/uuids returned no rental records")
+    if len(uuids) > 6000:
+        raise RuntimeError(f"{len(uuids)} rental records, more than this check reads")
+    query = urllib.parse.urlencode({"expand[lastPayment][]": "true"})
+    attempts = {}
+    for start in range(0, len(uuids), 500):
+        st, _, body = post(f"{INTEGRATION}/facilities/{facility_uuid}/rentalRecords/get_by_uuids?{query}",
+                           {"unitRentalRecordUuids": uuids[start:start + 500]}, {"x-api-key": key},
+                           timeout=PAY_TIMEOUT_S)
+        if st != 200:
+            raise RuntimeError(f"rentalRecords/get_by_uuids HTTP {st}")
+        chunk = json.loads(body)
+        if not isinstance(chunk, list):
+            raise RuntimeError("rentalRecords/get_by_uuids did not return a list")
+        for record in chunk:
+            when = _utc((record.get("lastPayment") or {}).get("lastPaymentDate"))
+            if record.get("rentalRecordUuid") and when:
+                attempts[record["rentalRecordUuid"]] = when
+    if not attempts:
+        raise RuntimeError("no rental record carries a lastPayment")
+    return attempts
+
+
+def _rentals(n):
+    return f"{n} rental has" if n == 1 else f"{n} rentals have"
+
+
+def judge_payments(rows, now, name, attempts=None, attempts_error=None):
+    """Pure decision for 1 facility's ledger of the last PAY_LOOKBACK_H hours. Hours and counts only.
+
+    attempts is payment_attempts() for the facility, read only while the silence is
+    past the limit and inside the backstop; attempts_error says why it could not be
+    read, which gives no verdict this run (neither alert nor all clear). Called
+    with neither, a silence past the limit alerts on its own, the rule before 13 Nov 2026.
+    """
     times = sorted(completed_card_payments(rows).values())
     last = times[-1] if times else None
     hours = round((now - last).total_seconds() / 3600, 1) if last else None
     limit = PAY_SILENCE_H[name]
-    reasons = []
+    backstop = round(limit * PAY_BACKSTOP_FACTOR)
+    reasons, quiet, unknown, tried = [], None, None, None
     if hours is None:
         reasons.append(f"no completed card payment in {PAY_LOOKBACK_H} hours (limit {limit} h)")
+    elif hours > backstop:
+        reasons.append(f"last completed card payment {hours:g} hours ago, past the {backstop} h backstop")
     elif hours > limit:
-        reasons.append(f"last completed card payment {hours:g} hours ago (limit {limit} h)")
+        if attempts is not None:
+            tried = sum(1 for when in attempts.values() if when > last)
+            if tried:
+                reasons.append(f"last completed card payment {hours:g} hours ago (limit {limit} h), and "
+                               f"{_rentals(tried)} tried to pay since then")
+            else:
+                quiet = (f"quiet: last completed card payment {hours:g} h ago (limit {limit} h), but nobody has "
+                         f"tried to pay since (alerts on the first attempt, or at {backstop} h)")
+        elif attempts_error:
+            unknown = (f"last completed card payment {hours:g} h ago (limit {limit} h); payment attempts could not "
+                       f"be read ({attempts_error}), so no verdict this run")
+        else:
+            reasons.append(f"last completed card payment {hours:g} hours ago (limit {limit} h)")
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     in_window = (now.day == 1 and now.hour >= PAY_MONTH_START_FROM_H) or 1 < now.day <= PAY_MONTH_START_DAYS
     since_start = sum(1 for t in times if t >= month_start) if in_window else None
@@ -438,41 +533,67 @@ def judge_payments(rows, now, name):
     if in_window and since_start < floor:
         reasons.append(f"{since_start} completed card payments since the 1st at 00:00 UTC, floor {floor}")
     return {"card_payments_in_lookback": len(times), "hours_since_last": hours, "limit_h": limit,
-            "since_month_start": since_start, "month_start_floor": floor,
+            "backstop_h": backstop, "since_month_start": since_start, "month_start_floor": floor,
+            "tried_since": tried, "quiet": None if reasons else quiet, "unknown": None if reasons else unknown,
             "reasons": reasons, "active": bool(reasons)}
 
 
-def card_payment_check(key, now, read=recent_payments):
-    """Card payments at both facilities. available is true only when EVERY facility was read."""
+def card_payment_check(key, now, read=recent_payments, read_attempts=payment_attempts):
+    """Card payments at both facilities. available is true only when every facility got a verdict."""
     if not key:
         return {"active": False, "available": False, "summary": "card payment check not run (Integration key missing)",
                 "detail": "", "facilities": {}, "errors": ["Integration key missing"]}
     since = now - timedelta(hours=PAY_LOOKBACK_H)
-    facilities, notes, errors = {}, [], []
+    facilities, notes, errors, unread = {}, [], [], []
     for name, _, uuid in SITES:
         try:
-            judged = judge_payments(read(key, uuid, since), now, name)
+            rows = read(key, uuid, since)
+            judged = judge_payments(rows, now, name)
         except Exception as e:  # noqa: BLE001
             errors.append(name)
             notes.append(f"{name}: ledger could not be read ({str(e)[:60]})")
             continue
+        hours = judged["hours_since_last"]
+        if hours is not None and judged["limit_h"] < hours <= judged["backstop_h"]:
+            # Only a silence between the limit and the backstop needs to know whether anyone tried to pay.
+            attempts, error = None, None
+            for attempt in range(PAY_ATTEMPT_TRIES):
+                try:
+                    attempts, error = read_attempts(key, uuid), None
+                    break
+                except Exception as e:  # noqa: BLE001
+                    error = str(e)[:60]
+                    if attempt + 1 < PAY_ATTEMPT_TRIES:
+                        time.sleep(PAY_ATTEMPT_RETRY_S)
+            judged = judge_payments(rows, now, name, attempts=attempts, attempts_error=error)
         facilities[name] = judged
         if judged["reasons"]:
             notes.append(f"{name}: " + "; ".join(judged["reasons"]))
+        elif judged["quiet"] or judged["unknown"]:
+            if judged["unknown"]:
+                unread.append(name)
+            notes.append(f"{name}: {judged['quiet'] or judged['unknown']}")
         else:
             note = f"{name}: last completed card payment {judged['hours_since_last']:g} h ago (limit {judged['limit_h']} h)"
             if judged["since_month_start"] is not None:
                 note += f", {judged['since_month_start']} since the 1st (floor {judged['month_start_floor']})"
             notes.append(note)
     hit = [n for n, f in facilities.items() if f["active"]]
+    quiet = [n for n, f in facilities.items() if f["quiet"]]
     if hit:
         summary = " and ".join(hit) + ": card payments have stopped completing in Monument"
     elif errors:
         summary = "could not read the ledger at " + " and ".join(errors) + "; card payments normal where it was read"
+    elif unread:
+        summary = ("could not read payment attempts at " + " and ".join(unread)
+                   + ", so no verdict on its card payment silence this run")
+    elif quiet:
+        summary = (" and ".join(quiet) + (" is" if len(quiet) == 1 else " are") + " quiet: past the card payment "
+                   "silence limit, but nobody has tried to pay since, so no block is seen")
     else:
         summary = "card payments completing normally at both facilities"
-    return {"active": bool(hit), "available": not errors, "summary": summary,
-            "detail": "".join(f"\n- {n}" for n in notes), "facilities": facilities, "errors": errors}
+    return {"active": bool(hit), "available": not errors and not unread, "summary": summary,
+            "detail": "".join(f"\n- {n}" for n in notes), "facilities": facilities, "errors": errors + unread}
 
 
 def main():
