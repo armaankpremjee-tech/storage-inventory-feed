@@ -7,14 +7,15 @@
 # The issues are state, not notifications (Armaan, 25 Oct 2026: "i get too many
 # github notifications"): no @mention, no assignee. The M4 watcher sets
 # ALERT_EMAIL_HELPER, which sends Armaan exactly 1 email per open bot-leads,
-# site-units-down, storefront-captcha-off or card-payments-silent issue (and per
-# degraded issue while Monument refuses the Integration key), and records it in
-# the issue body.
+# site-units-down, storefront-captcha-off, card-payments-silent or
+# online-rentals-silent issue (and per degraded issue while Monument refuses the
+# Integration key), and records it in the issue body.
 set -u
 now=$(date -u +%s)
 field() { python3 -c "import json,sys;r=json.load(open('result.json'));v=r.get(sys.argv[1]);print('' if v is None else v)" "$1"; }
 bot() { python3 -c "import json,sys;b=json.load(open('result.json')).get('bot_leads') or {};v=b.get(sys.argv[1]);print(v if isinstance(v,str) else (1 if v else 0))" "$1"; }
 pay() { python3 -c "import json,sys;b=json.load(open('result.json')).get('card_payments') or {};v=b.get(sys.argv[1]);print(v if isinstance(v,str) else (1 if v else 0))" "$1"; }
+onl() { python3 -c "import json,sys;b=json.load(open('result.json')).get('online_rentals') or {};v=b.get(sys.argv[1]);print(v if isinstance(v,str) else (1 if v else 0))" "$1"; }
 state=$(field state)
 summary=$(field summary)
 detail=$(field detail)
@@ -28,17 +29,23 @@ pay_active=$(pay active)
 pay_available=$(pay available)
 pay_summary=$(pay summary)
 pay_detail=$(pay detail)
+onl_active=$(onl active)
+onl_available=$(onl available)
+onl_summary=$(onl summary)
+onl_detail=$(onl detail)
 echo "$(date -u +%FT%TZ) state=$state $summary"
 echo "$(date -u +%FT%TZ) captcha=$captcha_state bot_leads active=$bot_active available=$bot_available $bot_summary"
 echo "$(date -u +%FT%TZ) card_payments active=$pay_active available=$pay_available $pay_summary"
+echo "$(date -u +%FT%TZ) online_rentals active=$onl_active available=$onl_available $onl_summary"
 open_issue() { gh issue list -R "$GITHUB_REPOSITORY" --label "$1" --state open --json number --jq '.[0].number // empty'; }
 down_issue=$(open_issue site-units-down)
 deg_issue=$(open_issue site-units-degraded)
 bot_issue=$(open_issue bot-leads)
 cap_issue=$(open_issue storefront-captcha-off)
 pay_issue=$(open_issue card-payments-silent)
+onl_issue=$(open_issue online-rentals-silent)
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  echo "DRY RUN, no issue changes. down_issue=${down_issue:-none} degraded_issue=${deg_issue:-none} bot_issue=${bot_issue:-none} captcha_issue=${cap_issue:-none} payments_issue=${pay_issue:-none}"
+  echo "DRY RUN, no issue changes. down_issue=${down_issue:-none} degraded_issue=${deg_issue:-none} bot_issue=${bot_issue:-none} captcha_issue=${cap_issue:-none} payments_issue=${pay_issue:-none} online_issue=${onl_issue:-none}"
   exit 0
 fi
 epoch_of() { python3 -c "import sys,datetime;s=sys.argv[1].replace('Z','+00:00');print(int(datetime.datetime.fromisoformat(s).timestamp()))" "$1" 2>/dev/null || echo 0; }
@@ -96,6 +103,26 @@ elif [ -n "$pay_issue" ] && [ "$pay_available" = "1" ]; then
   gh issue close "$pay_issue" -R "$GITHUB_REPOSITORY" --comment "$pclear"
 fi
 
+# Online rentals: open on the first run that reads BOTH facilities and finds no
+# self serve lead (an online rental or abandoned cart: source Website or Abandoned
+# Cart, no staff agent, nothing the bot lead rules flag) at either of them for
+# longer than the calibrated limit; comment every 6 hours while it lasts; close
+# only after a run that read both facilities and found a new one. A failed read is
+# unknown, never clear: an open issue stays open and none opens. The 6 Nov 2026
+# pattern, found by chance a week later. Hours and counts only: public repo.
+if [ "$onl_active" = "1" ]; then
+  printf -v obody '%s.\n\nNobody has completed an online rental or left an abandoned cart in the website checkout at either facility for longer than the limit, calibrated on every online rental and abandoned cart since 20 Aug 2026 so that a normal quiet spell does not open it. From 6 Nov 2026, when a human check went live on the rental flow, neither facility got a single one for over a week and nothing noticed. Evidence from this run (hours and counts only):\n%s\n\nWhat to do today: confirm the count read only, then load each website'"'"'s Rent Now checkout as a fresh visitor in Chrome and in Apple WebKit and see whether the Personal Information form appears. Never tick a human check and never submit a form. Nothing goes to tenants or Adela from this alert. This check runs every 5 minutes from GitHub and from the M4, comments every 6 hours while it lasts, and closes itself once a new online rental or abandoned cart arrives.' "$onl_summary" "$onl_detail"
+  if [ -z "$onl_issue" ]; then
+    create online-rentals-silent "Online rentals silent: $onl_summary" "$obody"
+  else
+    printf -v still 'Still silent: %s.\n%s' "$onl_summary" "$onl_detail"
+    comment_if_due "$onl_issue" 6 "$still"
+  fi
+elif [ -n "$onl_issue" ] && [ "$onl_available" = "1" ]; then
+  printf -v oclear 'Clear: %s.\n%s' "$onl_summary" "$onl_detail"
+  gh issue close "$onl_issue" -R "$GITHUB_REPOSITORY" --comment "$oclear"
+fi
+
 # Storefront captcha: its own issue, so it is announced at once and never hides,
 # or is hidden by, the snapshot and key alerts. Unknown changes nothing.
 if [ "$captcha_state" = "off" ]; then
@@ -142,7 +169,7 @@ esac
 
 # Delivery (the M4 only): 1 email per open alert issue, recorded in its body.
 if [ -n "${ALERT_EMAIL_HELPER:-}" ]; then
-  for label in bot-leads site-units-down storefront-captcha-off card-payments-silent site-units-degraded; do
+  for label in bot-leads site-units-down storefront-captcha-off card-payments-silent online-rentals-silent site-units-degraded; do
     if [ "$label" = "site-units-degraded" ] && [ "$integration_ok" != "False" ]; then
       continue  # degraded only pages while Monument refuses the Integration key
     fi

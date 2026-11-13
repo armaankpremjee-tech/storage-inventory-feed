@@ -27,6 +27,9 @@ No credentials are stored in this repository.
 homepage of both sites, probes Monument's storefront captcha, reads recent
 storefront leads and the ledger of completed card payments, and keeps 1 issue
 per alert here (labels `site-units-down`, `site-units-degraded`, `bot-leads`,
-`storefront-captcha-off`, `card-payments-silent`), closing each on recovery. The issues are state only and mention nobody. The M4 runs the same
+`storefront-captcha-off`, `card-payments-silent`, `online-rentals-silent`),
+closing each on recovery. `online-rentals-silent` opens when neither site has had
+an online rental or abandoned cart for longer than the calibrated limit (the 6 Nov
+2026 checkout stall). The issues are state only and mention nobody. The M4 runs the same
 scripts every 5 minutes (launchd `com.armaan.site-units-watch`) and sends the
 owner 1 email per open alert issue, so an alert does not depend on GitHub's cron.
