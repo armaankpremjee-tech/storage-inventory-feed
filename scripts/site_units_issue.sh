@@ -77,11 +77,13 @@ elif [ -n "$bot_issue" ] && [ "$bot_available" = "1" ]; then
 fi
 
 # Card payments: open on the first run that sees a facility's completed card
-# payments stopped (or a 1st of the month autopay run far below its floor),
-# comment every 6 hours while it lasts, close only after a run that read BOTH
-# ledgers and found both facilities normal. Hours and counts only: public repo.
+# payments stopped while tenants fail to pay, a silence past the backstop, or a
+# 1st of the month autopay run far below its floor; comment every 6 hours while
+# it lasts; close only after a run that read BOTH ledgers and saw no block at
+# either facility (a quiet week with nobody paying is not one, since 13 Nov 2026).
+# Hours and counts only: public repo.
 if [ "$pay_active" = "1" ]; then
-  printf -v pbody '%s.\n\nCompleted card payments are the heartbeat of a facility. Both times a card testing bot hit the Lifetime storefront in 2026 the card processor blocked the merchant and every card payment failed silently for days (12 to 27 Oct, noticed on day 13), while ACH kept working. Evidence from this run (hours and counts only):\n%s\n\nWhat to do today: read the open Monument ticket thread about the storefront and card testing in the personal mailbox before writing anything, and reply there (never a new Monument thread). Ask whether the processor or the card issuers have a block on the facility'"'"'s merchant account, since when, and the lift date; point tenants to ACH meanwhile. Nothing goes to tenants or Adela from this alert. This check runs every 5 minutes from GitHub and from the M4, comments every 6 hours while it lasts, and closes itself once both ledgers read normal again.' "$pay_summary" "$pay_detail"
+  printf -v pbody '%s.\n\nCompleted card payments are the heartbeat of a facility. Both times a card testing bot hit the Lifetime storefront in 2026 the card processor blocked the merchant and every card payment failed silently for days (12 to 27 Oct, noticed on day 13), while ACH kept working. Evidence from this run (hours and counts only):\n%s\n\nWhat to do today: first confirm in Monument (Billing, Transactions, Failed) that tenant card attempts are failing; a quiet week with nobody paying is not a block. Then read the open Monument ticket thread about the storefront and card testing in the personal mailbox before writing anything, and reply there (never a new Monument thread). Ask whether the processor or the card issuers have a block on the facility'"'"'s merchant account, since when, and the lift date; point tenants to ACH meanwhile. Nothing goes to tenants or Adela from this alert. This check runs every 5 minutes from GitHub and from the M4, comments every 6 hours while it lasts, and closes itself once both ledgers read normal again.' "$pay_summary" "$pay_detail"
   if [ -z "$pay_issue" ]; then
     create card-payments-silent "Card payments silent: $pay_summary" "$pbody"
   else
@@ -90,7 +92,7 @@ if [ "$pay_active" = "1" ]; then
   fi
 elif [ -n "$pay_issue" ] && [ "$pay_available" = "1" ]; then
   # A failed ledger read at either facility is unknown, never clear.
-  printf -v pclear 'Clear: completed card payments are back to normal at both facilities.\n%s' "$pay_detail"
+  printf -v pclear 'Clear: %s.\n%s' "$pay_summary" "$pay_detail"
   gh issue close "$pay_issue" -R "$GITHUB_REPOSITORY" --comment "$pclear"
 fi
 
