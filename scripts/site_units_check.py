@@ -64,10 +64,12 @@ online_rentals = read only through the Integration key: leads created at both
            quiet). A failed read is unknown, never clear. Hours and counts only
            in the output.
 """
+import atexit
 import bisect
 import json
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -153,12 +155,56 @@ ONLINE_SILENCE_H = 177           # hours without a self serve lead at EITHER fac
 ONLINE_MAX_LEADS = 3000          # recent_leads hydrates at most 3,000, so that many is a flood and gives no verdict
 
 
+# Requests made on our own Monument key in this run (26 Nov 2026). Monument allows 200,000 a month on it and
+# November's ran out on the 25th, so every consumer reports its count for the monthly meter
+# (~/.claude/scripts/monument_usage_meter.py on the M4): the Actions notice "monument_calls" in the cloud,
+# 1 JSON line in ~/.claude/state/monument-api-usage/calls.jsonl on the M4 (same fields as storage-pricing
+# src/monument_client.py). Requests on PUBLIC_KEY, Monument's own storefront key, are not ours and not counted.
+# Counting never raises and never changes a request.
+_KEYED_CALLS = {"calls": 0, "limit": False}
+
+
+def _count_keyed(headers, status=None):
+    try:
+        k = (headers or {}).get("x-api-key")
+        if k and k != PUBLIC_KEY:
+            if status is None:
+                _KEYED_CALLS["calls"] += 1
+            elif status == 429:
+                _KEYED_CALLS["limit"] = True
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _report_keyed_calls():
+    try:
+        calls = _KEYED_CALLS["calls"]
+        if calls <= 0:
+            return
+        print(f"MONUMENT_CALLS={calls}", file=sys.stderr, flush=True)
+        if os.environ.get("GITHUB_ACTIONS"):
+            print(f"::notice title=monument_calls::{calls}", file=sys.stderr, flush=True)
+            return
+        path = os.environ.get("MONUMENT_USAGE_LOG") or os.path.join(
+            os.path.expanduser("~"), ".claude", "state", "monument-api-usage", "calls.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        row = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+               "script": sys.argv[0] if sys.argv else "site_units_check.py", "calls": calls,
+               "quota_exhausted": bool(_KEYED_CALLS["limit"]), "host": socket.gethostname()}
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def get(url, headers=None, timeout=30):
     req = urllib.request.Request(url, headers={"user-agent": UA, **(headers or {})})
+    _count_keyed(headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, dict(r.headers), r.read()
     except urllib.error.HTTPError as e:
+        _count_keyed(headers, e.code)
         return e.code, dict(e.headers), e.read()
     except Exception as e:  # noqa: BLE001
         return 0, {}, repr(e).encode()
@@ -168,10 +214,12 @@ def post(url, body, headers=None, timeout=30):
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method="POST",
                                  headers={"user-agent": UA, "content-type": "application/json", **(headers or {})})
+    _count_keyed(headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, dict(r.headers), r.read()
     except urllib.error.HTTPError as e:
+        _count_keyed(headers, e.code)
         return e.code, dict(e.headers), e.read()
     except Exception as e:  # noqa: BLE001
         return 0, {}, repr(e).encode()
@@ -788,6 +836,7 @@ def _load_keyed_cache(now, max_min):
 
 
 def main():
+    atexit.register(_report_keyed_calls)   # only a real run reports; importing the module (tests) does not
     now = datetime.now(timezone.utc).replace(microsecond=0)
     sites = [check_site(*s) for s in SITES]
     diag = []
