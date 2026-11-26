@@ -6,6 +6,7 @@ changed, and status.json as a heartbeat (every run when inventory changed,
 otherwise at most once an hour, so the repo does not collect 288 commits a day).
 Exit 1 when any facility could not be refreshed, so the workflow run shows red.
 """
+import atexit
 import json
 import os
 import sys
@@ -22,6 +23,22 @@ BASE = "https://public-api.prd.monument.io/shopping/storagegiant/v1"
 HEARTBEAT_SECONDS = 3600
 
 
+# Requests made on our Monument key in this run (26 Nov 2026): Monument allows 200,000 a month and November's
+# ran out on the 25th. Reported once at exit as the Actions notice "monument_calls", which the monthly meter on
+# the M4 (~/.claude/scripts/monument_usage_meter.py) reads. Counting never raises and never changes a request.
+_CALLS = [0]
+
+
+def _report_calls():
+    try:
+        if _CALLS[0] > 0:
+            print(f"MONUMENT_CALLS={_CALLS[0]}", file=sys.stderr, flush=True)
+            if os.environ.get("GITHUB_ACTIONS"):
+                print(f"::notice title=monument_calls::{_CALLS[0]}", file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def fetch(facility_uuid, key):
     req = urllib.request.Request(
         f"{BASE}/facilities/{facility_uuid}/unitGroups",
@@ -29,6 +46,7 @@ def fetch(facility_uuid, key):
     )
     last = None
     for attempt in range(3):
+        _CALLS[0] += 1
         try:
             with urllib.request.urlopen(req, timeout=45) as r:
                 return r.status, json.loads(r.read())
@@ -62,6 +80,7 @@ def valid(raw):
 
 
 def main():
+    atexit.register(_report_calls)
     key = os.environ.get("MONUMENT_API_KEY", "").strip()
     if not key:
         print("MONUMENT_API_KEY is not set", file=sys.stderr)
