@@ -754,19 +754,58 @@ def online_rentals_check(key, now, read=recent_leads):
                 hours_since_last=hours, facilities=classified, errors=[])
 
 
+# Requests on our Integration key share 1 Monument usage plan of 200,000 a month, used up
+# on 25 Nov 2026 at 22:25Z; this check every 5 minutes on the M4 spent about a third of it.
+# The key probe and the 3 Monument checks below look back 24 hours, 15 days and 30 days,
+# so where SITE_UNITS_KEYED_CACHE_MIN is set (site_units_watch.sh on the M4 sets 30) they
+# ask Monument at most that often and the runs in between reuse the stored answers from
+# keyed_checks_cache.json. Unset (the cloud copy) every run asks Monument, as before.
+# The website checks above them are not cached.
+KEYED_CACHE_FILE = "keyed_checks_cache.json"
+_BOT_KEYS = ("active", "available", "summary", "detail")
+_ONLINE_KEYS = ("active", "available", "summary", "detail", "hours_since_last", "limit_h", "lookback_h")
+
+
+def _keyed_cache_min():
+    try:
+        return max(0, int(os.environ.get("SITE_UNITS_KEYED_CACHE_MIN", "0") or 0))
+    except ValueError:
+        return 0
+
+
+def _load_keyed_cache(now, max_min):
+    """The stored keyed answers when younger than max_min minutes, else None."""
+    if max_min <= 0:
+        return None
+    try:
+        c = json.load(open(KEYED_CACHE_FILE))
+        age = (now - datetime.fromisoformat(c["at"])).total_seconds()
+        if 0 <= age < max_min * 60 and all(k in c for k in ("integration_diag", "integration_ok", "bots", "pays", "online")):
+            return c
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def main():
     now = datetime.now(timezone.utc).replace(microsecond=0)
     sites = [check_site(*s) for s in SITES]
     diag = []
     key = os.environ.get("MONUMENT_API_KEY", "").strip()
     probe_uuid = SITES[1][2]
-    if key:
+    cache_min = _keyed_cache_min()
+    cached = _load_keyed_cache(now, cache_min) if key else None
+    if cached:
+        integration_diag = cached["integration_diag"] + f" (stored answer of {cached['at']}, asked every {cache_min} min)"
+        integration_ok = cached["integration_ok"]
+    elif key:
         st, _, body = get(f"{SHOPPING}/facilities/{probe_uuid}/unitGroups", {"x-api-key": key})
-        diag.append(f"Monument direct with the Integration key: HTTP {st}" + ("" if st == 200 else f" {body[:100].decode(errors='ignore')}"))
+        integration_diag = f"Monument direct with the Integration key: HTTP {st}" + ("" if st == 200 else f" {body[:100].decode(errors='ignore')}")
         integration_ok = st == 200
     else:
-        diag.append("Monument direct with the Integration key: not probed (secret missing)")
+        integration_diag = "Monument direct with the Integration key: not probed (secret missing)"
         integration_ok = None
+    diag.append(integration_diag)
     captcha_state, captcha_note = probe_captcha()
     diag.append(f"Monument direct with the public storefront key: {captcha_note}")
     st, _, body = get(FEED_STATUS)
@@ -782,11 +821,24 @@ def main():
         except Exception as e:  # noqa: BLE001
             feed_note += f", unreadable ({e!r})"
     diag.append(feed_note)
-    bots = bot_lead_check(key, now)
+    if cached:
+        bots, pays, online = cached["bots"], cached["pays"], cached["online"]
+    else:
+        bots = bot_lead_check(key, now)
+        pays = card_payment_check(key, now)
+        online = online_rentals_check(key, now)
+        if key and cache_min > 0:
+            try:
+                stored = {"at": now.isoformat(), "integration_diag": integration_diag, "integration_ok": integration_ok,
+                          "bots": {k: bots[k] for k in _BOT_KEYS}, "pays": {k: pays[k] for k in _BOT_KEYS},
+                          "online": {k: online[k] for k in _ONLINE_KEYS}}
+                with open(KEYED_CACHE_FILE + ".tmp", "w") as fh:
+                    json.dump(stored, fh)
+                os.replace(KEYED_CACHE_FILE + ".tmp", KEYED_CACHE_FILE)
+            except Exception:  # noqa: BLE001
+                pass
     diag.append("bot lead tripwire: " + bots["summary"])
-    pays = card_payment_check(key, now)
     diag.append("card payments: " + pays["summary"])
-    online = online_rentals_check(key, now)
     diag.append("online rentals: " + online["summary"])
 
     down = [s for s in sites if not (s["api_ok"] and s["cards_ok"])]
